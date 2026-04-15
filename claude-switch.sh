@@ -195,6 +195,48 @@ _claude_switch_init() {
 }
 _claude_switch_init
 
+# --- Account identity helpers ---
+
+# Read raw keychain JSON for an account dir (falls back to .credentials.json)
+_claude_acc_token() {
+    local acc_dir="$1"
+    local hash key raw
+    hash=$(printf '%s' "$acc_dir" | shasum -a 256 | cut -c1-8)
+    key="Claude Code-credentials-${hash}"
+    raw=$(security find-generic-password -s "$key" -a "$(id -un)" -w 2>/dev/null)
+    if [[ -n "$raw" ]]; then echo "$raw"; return 0; fi
+    local creds="$acc_dir/.credentials.json"
+    if [[ -f "$creds" ]]; then
+        raw=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds" 2>/dev/null)
+        [[ -n "$raw" ]] && printf '{"claudeAiOauth":{"accessToken":"%s"}}' "$raw" && return 0
+    fi
+    return 1
+}
+
+# Fetch /api/oauth/profile and save .account-info.json (silent on failure)
+_claude_acc_fetch_info() {
+    local acc_dir="$1"
+    local raw access_token profile email
+    raw=$(_claude_acc_token "$acc_dir") || return 1
+    access_token=$(printf '%s' "$raw" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+    [[ -z "$access_token" ]] && return 1
+    profile=$(curl -sf --max-time 5 \
+        -H "Authorization: Bearer $access_token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        https://api.anthropic.com/api/oauth/profile 2>/dev/null) || return 1
+    email=$(printf '%s' "$profile" | jq -r '.account.email // empty' 2>/dev/null)
+    [[ -z "$email" ]] && return 1
+    printf '%s' "$profile" | jq -c '{email:.account.email,name:.account.full_name,org:.organization.name}' \
+        > "$acc_dir/.account-info.json"
+}
+
+# Read email from saved .account-info.json
+_claude_acc_email() {
+    local info="$CLAUDE_SWITCH_ACCOUNTS_DIR/$1/.account-info.json"
+    [[ -f "$info" ]] && jq -r '.email // empty' "$info" 2>/dev/null
+}
+
+
 # --- Безопасные операции с файлом links ---
 
 # Проверить, есть ли в links точная запись для директории
@@ -331,10 +373,13 @@ _claude_acc_list() {
 
     _msg list_header
     for acc in "${accounts[@]}"; do
+        local email=$(_claude_acc_email "$acc")
+        local email_str=""
+        [[ -n "$email" ]] && email_str="  ${email}"
         if [[ "$acc" == "$default_acc" ]]; then
-            echo "  ★ $acc  $(_msg list_default)"
+            echo "  ★ $acc  $(_msg list_default)${email_str}"
         else
-            echo "    $acc"
+            echo "    $acc${email_str}"
         fi
     done
 }
@@ -362,6 +407,7 @@ _claude_acc_add() {
     mkdir -p "$acc_dir"
     _msg add_created "$name"
     CLAUDE_CONFIG_DIR="$acc_dir" claude login
+    _claude_acc_fetch_info "$acc_dir"
     echo ""
     _msg add_done
     _msg add_hint_default "$name"
@@ -384,6 +430,7 @@ _claude_acc_login() {
 
     _msg login_start "$name"
     CLAUDE_CONFIG_DIR="$acc_dir" claude login
+    _claude_acc_fetch_info "$acc_dir"
     _msg login_done
 }
 
@@ -557,7 +604,10 @@ _claude_acc_status() {
     fi
 
     if [[ -n "$account" ]]; then
-        _msg status_active "$account" "$source_info"
+        local email=$(_claude_acc_email "$account")
+        local label="$account"
+        [[ -n "$email" ]] && label="$account <${email}>"
+        _msg status_active "$label" "$source_info"
     else
         _msg status_standard
     fi

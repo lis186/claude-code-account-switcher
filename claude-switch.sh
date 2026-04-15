@@ -197,43 +197,40 @@ _claude_switch_init
 
 # --- Account identity helpers ---
 
-# Read raw keychain JSON for an account dir (falls back to .credentials.json)
+# Keychain service name is keyed by sha256(CLAUDE_CONFIG_DIR) — must match Claude Code's dV() function
 _claude_acc_token() {
     local acc_dir="$1"
-    local hash key raw
+    local hash token
     hash=$(printf '%s' "$acc_dir" | shasum -a 256 | cut -c1-8)
-    key="Claude Code-credentials-${hash}"
-    raw=$(security find-generic-password -s "$key" -a "$(id -un)" -w 2>/dev/null)
-    if [[ -n "$raw" ]]; then echo "$raw"; return 0; fi
-    local creds="$acc_dir/.credentials.json"
-    if [[ -f "$creds" ]]; then
-        raw=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds" 2>/dev/null)
-        [[ -n "$raw" ]] && printf '{"claudeAiOauth":{"accessToken":"%s"}}' "$raw" && return 0
+    token=$(security find-generic-password -s "Claude Code-credentials-${hash}" -a "$(id -un)" -w 2>/dev/null)
+    if [[ -n "$token" ]]; then
+        printf '%s' "$token" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null
+        return 0
     fi
-    return 1
+    jq -r '.claudeAiOauth.accessToken // empty' "$acc_dir/.credentials.json" 2>/dev/null
 }
 
-# Fetch /api/oauth/profile and save .account-info.json (silent on failure)
 _claude_acc_fetch_info() {
     local acc_dir="$1"
-    local raw access_token profile email
-    raw=$(_claude_acc_token "$acc_dir") || return 1
-    access_token=$(printf '%s' "$raw" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+    local access_token
+    access_token=$(_claude_acc_token "$acc_dir")
     [[ -z "$access_token" ]] && return 1
-    profile=$(curl -sf --max-time 5 \
+    curl -sf --max-time 5 \
         -H "Authorization: Bearer $access_token" \
         -H "anthropic-beta: oauth-2025-04-20" \
-        https://api.anthropic.com/api/oauth/profile 2>/dev/null) || return 1
-    email=$(printf '%s' "$profile" | jq -r '.account.email // empty' 2>/dev/null)
-    [[ -z "$email" ]] && return 1
-    printf '%s' "$profile" | jq -c '{email:.account.email,name:.account.full_name,org:.organization.name}' \
-        > "$acc_dir/.account-info.json"
+        https://api.anthropic.com/api/oauth/profile 2>/dev/null \
+        | jq -c 'select(.account.email) | {email:.account.email,name:.account.full_name,org:.organization.name}' \
+        > "$acc_dir/.account-info.json.tmp" 2>/dev/null
+    if [[ -s "$acc_dir/.account-info.json.tmp" ]]; then
+        mv "$acc_dir/.account-info.json.tmp" "$acc_dir/.account-info.json"
+    else
+        rm -f "$acc_dir/.account-info.json.tmp"
+        return 1
+    fi
 }
 
-# Read email from saved .account-info.json
 _claude_acc_email() {
-    local info="$CLAUDE_SWITCH_ACCOUNTS_DIR/$1/.account-info.json"
-    [[ -f "$info" ]] && jq -r '.email // empty' "$info" 2>/dev/null
+    jq -r '.email // empty' "$CLAUDE_SWITCH_ACCOUNTS_DIR/$1/.account-info.json" 2>/dev/null
 }
 
 

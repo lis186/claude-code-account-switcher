@@ -406,7 +406,7 @@ _claude_acc_add() {
 
     mkdir -p "$acc_dir"
     _msg add_created "$name"
-    CLAUDE_CONFIG_DIR="$acc_dir" claude login
+    CLAUDE_CONFIG_DIR="$acc_dir" claude auth login
     _claude_acc_fetch_info "$acc_dir"
     echo ""
     _msg add_done
@@ -429,7 +429,7 @@ _claude_acc_login() {
     fi
 
     _msg login_start "$name"
-    CLAUDE_CONFIG_DIR="$acc_dir" claude login
+    CLAUDE_CONFIG_DIR="$acc_dir" claude auth login
     _claude_acc_fetch_info "$acc_dir"
     _msg login_done
 }

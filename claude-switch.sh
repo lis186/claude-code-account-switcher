@@ -54,6 +54,8 @@ _claude_msg_en=(
     help_unlink         "Unlink current directory"
     help_links          "Show all directory links"
     help_status         "Current account and context"
+    help_lock           "Pin current token identity as expected for account"
+    help_doctor         "Audit all accounts for identity drift"
     help_help           "Help"
     list_empty          "No accounts. Add one: claude-acc add <name>"
     list_header         "Claude Code accounts:"
@@ -109,6 +111,8 @@ _claude_msg_ru=(
     help_unlink         "Убрать привязку с текущей директории"
     help_links          "Показать все привязки директорий"
     help_status         "Текущий аккаунт и контекст"
+    help_lock           "Зафиксировать текущую личность как ожидаемую"
+    help_doctor         "Проверить все аккаунты на дрейф личности"
     help_help           "Справка"
     list_empty          "Нет аккаунтов. Добавьте: claude-acc add <name>"
     list_header         "Аккаунты Claude Code:"
@@ -231,6 +235,43 @@ _claude_acc_fetch_info() {
 
 _claude_acc_email() {
     jq -r '.email // empty' "$CLAUDE_SWITCH_ACCOUNTS_DIR/$1/.account-info.json" 2>/dev/null
+}
+
+# --- Identity lock ---
+# Pins the expected Anthropic account UUID to each account dir so that a silent
+# re-auth (via /login or OAuth refresh) cannot swap the stored token for one
+# belonging to a different identity without being noticed.
+
+_claude_acc_uuid_from_token() {
+    local acc_dir="$1"
+    local access_token
+    access_token=$(_claude_acc_token "$acc_dir")
+    [[ -z "$access_token" ]] && return 1
+    curl -sf --max-time 5 \
+        -H "Authorization: Bearer $access_token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        https://api.anthropic.com/api/oauth/profile 2>/dev/null \
+        | jq -r '.account.uuid // empty' 2>/dev/null
+}
+
+_claude_acc_write_lock() {
+    local acc_dir="$1" uuid="$2"
+    [[ -z "$uuid" ]] && return 1
+    printf '{"uuid":"%s"}\n' "$uuid" > "$acc_dir/.identity-lock.json"
+}
+
+_claude_acc_read_lock() {
+    jq -r '.uuid // empty' "$1/.identity-lock.json" 2>/dev/null
+}
+
+# 0=match, 1=mismatch, 2=no lock, 3=cannot verify (no token / offline)
+_claude_acc_verify_lock() {
+    local acc_dir="$1" locked current
+    locked=$(_claude_acc_read_lock "$acc_dir")
+    [[ -z "$locked" ]] && return 2
+    current=$(_claude_acc_uuid_from_token "$acc_dir")
+    [[ -z "$current" ]] && return 3
+    [[ "$locked" == "$current" ]]
 }
 
 
@@ -356,6 +397,8 @@ _claude_acc_help() {
     echo "  claude-acc unlink            $(_msg help_unlink)"
     echo "  claude-acc links             $(_msg help_links)"
     echo "  claude-acc status            $(_msg help_status)"
+    echo "  claude-acc lock <name>       $(_msg help_lock)"
+    echo "  claude-acc doctor            $(_msg help_doctor)"
 }
 
 _claude_acc_list() {
@@ -403,8 +446,15 @@ _claude_acc_add() {
 
     mkdir -p "$acc_dir"
     _msg add_created "$name"
-    CLAUDE_CONFIG_DIR="$acc_dir" claude auth login
+    CLAUDE_CONFIG_DIR="$acc_dir" command claude auth login
     _claude_acc_fetch_info "$acc_dir"
+    local uuid
+    uuid=$(_claude_acc_uuid_from_token "$acc_dir")
+    if [[ -n "$uuid" ]]; then
+        _claude_acc_write_lock "$acc_dir" "$uuid"
+    else
+        echo "⚠  Could not fetch identity UUID. Run: claude-acc lock $name"
+    fi
     echo ""
     _msg add_done
     _msg add_hint_default "$name"
@@ -425,9 +475,46 @@ _claude_acc_login() {
         return 1
     fi
 
+    local kc_service hash locked prev_token
+    hash=$(printf '%s' "$acc_dir" | shasum -a 256 | cut -c1-8)
+    kc_service="Claude Code-credentials-${hash}"
+    locked=$(_claude_acc_read_lock "$acc_dir")
+    prev_token=$(security find-generic-password -s "$kc_service" -a "$(id -un)" -w 2>/dev/null)
+
     _msg login_start "$name"
-    CLAUDE_CONFIG_DIR="$acc_dir" claude auth login
+    CLAUDE_CONFIG_DIR="$acc_dir" command claude auth login
+
+    if [[ -n "$locked" ]]; then
+        local new_uuid
+        new_uuid=$(_claude_acc_uuid_from_token "$acc_dir")
+        if [[ -z "$new_uuid" ]]; then
+            echo "⚠  Could not verify identity after login (offline?). Skipping lock check."
+        elif [[ "$new_uuid" != "$locked" ]]; then
+            echo "❌ Identity mismatch for '$name'."
+            echo "   Expected UUID: $locked"
+            echo "   Got UUID:      $new_uuid"
+            if [[ -n "$prev_token" ]]; then
+                echo "   Rolling back to previous credentials."
+                security add-generic-password -U \
+                    -s "$kc_service" \
+                    -a "$(id -un)" \
+                    -w "$prev_token" >/dev/null 2>&1
+            else
+                echo "   Removing mis-logged credentials."
+                security delete-generic-password \
+                    -s "$kc_service" \
+                    -a "$(id -un)" >/dev/null 2>&1
+            fi
+            return 1
+        fi
+    fi
+
     _claude_acc_fetch_info "$acc_dir"
+    if [[ -z "$locked" ]]; then
+        local uuid
+        uuid=$(_claude_acc_uuid_from_token "$acc_dir")
+        [[ -n "$uuid" ]] && _claude_acc_write_lock "$acc_dir" "$uuid"
+    fi
     _msg login_done
 }
 
@@ -616,6 +703,58 @@ _claude_acc_reset() {
     _claude_activate
 }
 
+_claude_acc_lock() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo "Usage: claude-acc lock <name>"
+        echo "Pins the current token identity as the expected identity for this account."
+        return 1
+    fi
+    _claude_validate_name "$name" || return 1
+
+    local acc_dir="$CLAUDE_SWITCH_ACCOUNTS_DIR/$name"
+    if [[ ! -d "$acc_dir" ]]; then
+        _msg login_not_found "$name"
+        return 1
+    fi
+
+    local uuid
+    uuid=$(_claude_acc_uuid_from_token "$acc_dir")
+    if [[ -z "$uuid" ]]; then
+        echo "Could not fetch identity. Is '$name' logged in and online?"
+        return 1
+    fi
+    _claude_acc_write_lock "$acc_dir" "$uuid"
+    echo "Locked '$name' → UUID $uuid"
+}
+
+_claude_acc_doctor() {
+    local accounts=("$CLAUDE_SWITCH_ACCOUNTS_DIR"/*(N:t))
+    if [[ ${#accounts} -eq 0 ]]; then
+        echo "No accounts."
+        return
+    fi
+    local acc acc_dir rc locked current email any_bad=0
+    for acc in "${accounts[@]}"; do
+        acc_dir="$CLAUDE_SWITCH_ACCOUNTS_DIR/$acc"
+        _claude_acc_verify_lock "$acc_dir"
+        rc=$?
+        locked=$(_claude_acc_read_lock "$acc_dir")
+        current=$(_claude_acc_uuid_from_token "$acc_dir")
+        email=$(_claude_acc_email "$acc")
+        case $rc in
+            0) echo "✓ $acc  [${email:-unknown}]  uuid=$current" ;;
+            1) echo "✗ $acc  DRIFT  expected=$locked got=${current:-<unknown>}"
+               echo "    fix: claude-acc login $acc"
+               any_bad=1 ;;
+            2) echo "? $acc  no identity lock"
+               echo "    fix: claude-acc lock $acc" ;;
+            3) echo "? $acc  cannot verify (offline or no token)" ;;
+        esac
+    done
+    return $any_bad
+}
+
 # =============================================================
 # Единая точка входа
 # =============================================================
@@ -635,6 +774,8 @@ claude-acc() {
         unlink)  _claude_acc_unlink "$@" ;;
         links)   _claude_acc_links ;;
         status)  _claude_acc_status "$@" ;;
+        lock)    _claude_acc_lock "$@" ;;
+        doctor)  _claude_acc_doctor ;;
         help)    _claude_acc_help ;;
         *)       _claude_acc_help ;;
     esac
@@ -657,6 +798,8 @@ _claude_acc_completion() {
         "unlink:$(_msg help_unlink)"
         "links:$(_msg help_links)"
         "status:$(_msg help_status)"
+        "lock:$(_msg help_lock)"
+        "doctor:$(_msg help_doctor)"
         "help:$(_msg help_help)"
     )
 
@@ -664,7 +807,7 @@ _claude_acc_completion() {
         _describe 'command' subcmds
     elif (( CURRENT == 3 )); then
         case "${words[2]}" in
-            login|remove)
+            login|remove|lock)
                 accounts=("$CLAUDE_SWITCH_ACCOUNTS_DIR"/*(N:t))
                 _describe 'account' accounts
                 ;;
@@ -677,3 +820,48 @@ _claude_acc_completion() {
 }
 
 compdef _claude_acc_completion claude-acc
+
+# =============================================================
+# Launch gate: verify token identity matches .identity-lock.json
+# before running `claude` in a managed CLAUDE_CONFIG_DIR
+# =============================================================
+
+claude() {
+    # Pass through meta commands that don't need (or shouldn't be blocked by)
+    # an identity check: auth flows (user's only way to recover from drift),
+    # help, version.
+    case "$1" in
+        auth|--help|-h|--version|-v)
+            command claude "$@"
+            return
+            ;;
+    esac
+
+    # Only gate when operating inside a switcher-managed account dir.
+    if [[ -z "$CLAUDE_CONFIG_DIR" ]] || [[ "$CLAUDE_CONFIG_DIR" != "$CLAUDE_SWITCH_ACCOUNTS_DIR"/* ]]; then
+        command claude "$@"
+        return
+    fi
+
+    local acc_dir="$CLAUDE_CONFIG_DIR"
+    local acc_name="${acc_dir##*/}"
+    _claude_acc_verify_lock "$acc_dir"
+    case $? in
+        0) ;;
+        1)
+            local locked current
+            locked=$(_claude_acc_read_lock "$acc_dir")
+            current=$(_claude_acc_uuid_from_token "$acc_dir")
+            echo "❌ Claude Code identity drift detected for account '$acc_name'" >&2
+            echo "   Expected UUID: $locked" >&2
+            echo "   Current UUID:  ${current:-<unknown>}" >&2
+            echo "   Fix: claude-acc login $acc_name" >&2
+            return 1
+            ;;
+        2)
+            echo "⚠  Account '$acc_name' has no identity lock. Run: claude-acc lock $acc_name" >&2
+            ;;
+        3) ;;  # offline or no token: fail open
+    esac
+    command claude "$@"
+}
